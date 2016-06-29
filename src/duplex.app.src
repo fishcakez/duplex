@@ -1,0 +1,16 @@
+{application, duplex,
+ [{description, "Full/half duplex brokered connection behaviour"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications,
+   [kernel,
+    stdlib,
+    sbroker,
+    backoff
+   ]},
+  {env,[]},
+  {modules, []},
+  {maintainers, ["James Fish"]},
+  {licenses, ["Apache v2.0"]},
+  {links, [{"Github", "https://github.com/fishcakez/duplex"}]}
+ ]}.
