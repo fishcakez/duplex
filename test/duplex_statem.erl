@@ -35,6 +35,7 @@
 -export([cleanup/1]).
 
 -export([start_link/1]).
+-export([start_link/2]).
 -export([init/1]).
 -export([handle_open/1]).
 -export([handle_activate/2]).
@@ -89,7 +90,7 @@ prop_duplex() ->
 initial_state() ->
     #state{}.
 
-command(#state{sbroker=undefined, duplex=undefined} = State) ->
+command(#state{duplex=undefined} = State) ->
     {call, ?MODULE, start_link, start_link_args(State)};
 command(#state{buffer=undefined, recv_closed=[_|_]} = State) ->
     frequency([{1, {call, ?MODULE, start_client, start_client_args(State)}},
@@ -125,7 +126,7 @@ command(#state{} = State) ->
 
 precondition(State, {call, _, start_link, Args}) ->
     start_link_pre(State, Args);
-precondition(#state{sbroker=undefined, duplex=undefined}, _) ->
+precondition(#state{duplex=undefined}, _) ->
     false;
 precondition(#state{buffer=undefined}, {call, _, start_client, _}) ->
     true;
@@ -210,19 +211,21 @@ cleanup(#state{sbroker=undefined, duplex=undefined}) ->
     application:unset_env(duplex, handle_open),
     application:unset_env(duplex, handle_deactivate),
     flush_acks();
-cleanup(#state{sbroker=Broker, duplex=Duplex} = State) ->
+cleanup(#state{sbroker=Broker, duplex=undefined} = State) ->
+    sys:terminate(Broker, normal),
+    cleanup(State#state{sbroker=undefined});
+cleanup(#state{duplex=Duplex} = State) ->
     Trap = process_flag(trap_exit, true),
     exit(Duplex, shutdown),
     receive
         {'EXIT', Duplex, shutdown} ->
-            process_flag(trap_exit, Trap)
+            process_flag(trap_exit, Trap),
+            cleanup(State#state{duplex=undefined})
     after
         ?TIMEOUT ->
             process_flag(trap_exit, Trap),
             exit(timeout)
-    end,
-    sys:terminate(Broker, normal),
-    cleanup(State#state{sbroker=undefined, duplex=undefined}).
+    end.
 
 init({sbroker, Tester}) ->
     Ask = {duplex_statem_queue, {Tester, ask, {out, drop, infinity}}},
@@ -282,6 +285,9 @@ handle_close(Reason, Pid) ->
 
 handle(Pid, Fun, Req) ->
     receive
+        {Fun, Pid, exit} ->
+            _ = Pid ! {Fun, self(), Req},
+            exit(oops);
         {Fun, Pid, Result} ->
             _ = Pid ! {Fun, self(), Req},
             Result
@@ -289,6 +295,12 @@ handle(Pid, Fun, Req) ->
 
 handle(Pid, Fun, Req, Buffer) ->
     receive
+        {Fun, Pid, bad} ->
+            _ = Pid ! {Fun, self(), Req, Buffer},
+            bad;
+        {Fun, Pid, exit} ->
+            _ = Pid ! {Fun, self(), Req, Buffer},
+            exit(oops);
         {Fun, Pid, {recv, NReq}} when Fun == handle_send_recv ->
             _ = Pid ! {Fun, self(), Req, Buffer},
             {recv, NReq, Buffer+1};
@@ -308,17 +320,24 @@ handle(Pid, Fun, Req, Buffer) ->
 
 start_link(Mode) ->
     {ok, Broker} = sbroker:start_link(?MODULE, {sbroker, self()}, []),
+    start_link(Mode, Broker).
+
+start_link(Mode, Broker) ->
     Arg = {duplex, Mode, self(), Broker},
     {ok, Pid} = duplex:start_link(?MODULE, Arg, []),
     {ok, Pid, Broker}.
 
-start_link_args(_) ->
-    [oneof([half_duplex, full_duplex])].
+start_link_args(#state{sbroker=undefined}) ->
+    [oneof([half_duplex, full_duplex])];
+start_link_args(#state{sbroker=Broker}) ->
+    [oneof([half_duplex, full_duplex]), Broker].
 
-start_link_pre(#state{sbroker=Broker, duplex=Duplex}, _) ->
-    Broker == undefined orelse Duplex == undefined.
+start_link_pre(#state{sbroker=Broker, duplex=Duplex}, [_]) ->
+    Broker == undefined andalso Duplex == undefined;
+start_link_pre(#state{sbroker=Broker, duplex=Duplex}, [_, Broker2]) ->
+    Broker == Broker2 andalso Duplex == undefined.
 
-start_link_next(State, Value, [Mode]) ->
+start_link_next(State, Value, [Mode | _]) ->
     Duplex = {call, erlang, element, [2, Value]},
     Broker = {call, erlang, element, [3, Value]},
     State#state{sbroker=Broker, duplex=Duplex, mode=Mode}.
@@ -450,8 +469,8 @@ deactivate(Result, Broker, Req) ->
     application:set_env(duplex, handle_deactivate, Result),
     start_client(Broker, Req).
 
-deactivate_args(#state{sbroker=Broker}) ->
-    [{close, oneof([x, y, x])}, Broker, oneof([a, b, c])].
+deactivate_args(State) ->
+    [{close, oneof([x, y, x])} | start_client_args(State)].
 
 deactivate_pre(#state{send=[], recv=[], owner=active}, _) ->
     true;
@@ -571,13 +590,26 @@ shutdown_client_post(#state{duplex=Duplex, result=Results}, [Client], _) ->
     Reason = {'DOWN', Client, shutdown},
     close_post(Duplex, Reason) andalso result_post(Results).
 
+send(Client, {Bad, Duplex}) when Bad == bad; Bad == exit ->
+    Trap = process_flag(trap_exit, true),
+    Client ! {handle_send, self(), Bad},
+    receive
+        {'EXIT', Duplex, Reason} ->
+            process_flag(trap_exit, Trap),
+            Reason
+    after
+        ?TIMEOUT ->
+            process_flag(trap_exit, Trap),
+            exit(timeout)
+    end;
 send(Client, Result) ->
     Client ! {handle_send, self(), Result},
     ok.
 
-send_args(#state{send=[{Client, _Req} | _]}) ->
-    Return = frequency([{1, {result, foo}},
-                        {1, {close, oneof([x, y, z]), oneof([a, b, c])}},
+send_args(#state{duplex=Duplex, send=[{Client, _Req} | _]}) ->
+    Return = frequency([{1, {oneof([bad, exit]), Duplex}},
+                        {2, {result, foo}},
+                        {2, {close, oneof([x, y, z]), oneof([a, b, c])}},
                         {8, {send_recv, oneof([a, b, c])}},
                         {8, {recv, oneof([a, b, c])}}]),
     [Client, Return];
@@ -621,7 +653,15 @@ send_next(#state{send=[{Client, _} | Sends], recv=Recvs, result=Results,
           [Client, {close, Reason, Res}]) ->
     State#state{buffer=undefined, send=Sends, recv=[],
                 recv_closed=RecvClosed ++ Recvs,
-                result=Results++[{Client, Res}], close=[Reason]}.
+                result=Results++[{Client, Res}], close=[Reason]};
+send_next(#state{owner=passive, send=[{Client, _} | Sends], recv=[]} = State, _,
+          [Client, {Bad, _}]) when Bad == bad; Bad == exit ->
+    State#state{duplex=undefined, buffer=undefined, send=Sends};
+send_next(#state{send=[{Client, _} | Sends], recv=Recvs,
+                 recv_closed=RecvClosed} = State, _,
+          [Client, {Bad, _}]) when Bad == bad; Bad == exit ->
+    State#state{duplex=undefined, buffer=undefined, send=Sends, recv=[],
+                recv_closed=RecvClosed ++ Recvs}.
 
 send_post(#state{owner=active, duplex=Duplex, buffer=Buffer} = State, Args,
           Result) ->
@@ -645,20 +685,41 @@ send_post(#state{send=[{Client, Req} | _], recv=Recvs, result=Results,
             {close, Reason, Res} = Return,
             close_post(Duplex, Reason) andalso result_post(Client, Res);
         {handle_send, Client, Req} when element(1, Return) == close ->
-            true
+            true;
+        {handle_send, Client, Req} when element(1, Return) == bad ->
+            Reason = {bad_return_value, bad},
+            exit_post(Duplex, Reason) andalso
+            result_post(Client, {'EXIT', Reason}) andalso result_post(Results);
+        {handle_send, Client, Req} when element(1, Return) == exit ->
+            exit_post(Duplex, oops) andalso
+            result_post(Client, {'EXIT', oops}) andalso result_post(Results)
     after
         ?TIMEOUT ->
             unexpected(Client)
     end.
 
+send_recv(Client, {Bad, Duplex}) when Bad == bad; Bad == exit ->
+    Trap = process_flag(trap_exit, true),
+    Client ! {handle_send_recv, self(), Bad},
+    receive
+        {'EXIT', Duplex, Reason} ->
+            process_flag(trap_exit, Trap),
+            Reason
+    after
+        ?TIMEOUT ->
+            process_flag(trap_exit, Trap),
+            exit(timeout)
+    end;
 send_recv(Client, Result) ->
     Client ! {handle_send_recv, self(), Result},
     ok.
 
-send_recv_args(#state{send=[{Client, _} | _], recv=[{Client, _} | _]}) ->
-    Return = frequency([{1, {close, oneof([x, y, z]), oneof([a, b, c])}},
-                        {4, {result, foo}},
-                        {4, {recv, oneof([a, b, c])}}]),
+send_recv_args(#state{send=[{Client, _} | _], recv=[{Client, _} | _],
+                      duplex=Duplex}) ->
+    Return = frequency([{1, {oneof([bad, exit]), Duplex}},
+                        {2, {close, oneof([x, y, z]), oneof([a, b, c])}},
+                        {8, {result, foo}},
+                        {8, {recv, oneof([a, b, c])}}]),
     [Client, Return];
 send_recv_args(_) ->
     [undefined, undefined].
@@ -677,7 +738,11 @@ send_recv_next(#state{send=[{Client, _} | Sends], recv=[{Client, _}],
     State#state{buffer=Buffer+1, send=Sends, recv=[{Client, Req}], result=[]};
 send_recv_next(#state{send=[{Client, _} | Sends], recv=[{Client, _}]} = State,
                _, [Client, {close, _, _}]) ->
-    State#state{buffer=undefined, send=Sends, recv=[], result=[]}.
+    State#state{buffer=undefined, send=Sends, recv=[], result=[]};
+send_recv_next(#state{send=[{Client, _} | Sends], recv=[{Client, _}]} = State,
+               _, [Client, {Bad, _}]) when Bad == bad; Bad == exit ->
+    State#state{duplex=undefined, buffer=undefined, send=Sends, recv=[],
+                result=[]}.
 
 send_recv_post(#state{send=[{Client, Req} | _], buffer=Buffer, result=Results,
                       duplex=Duplex}, [Client, Return], _) ->
@@ -693,19 +758,39 @@ send_recv_post(#state{send=[{Client, Req} | _], buffer=Buffer, result=Results,
         {handle_send_recv, Client, Req, _} when element(1, Return) == close ->
             {close, Reason, Res} = Return,
             result_post(Client, Res) andalso close_post(Duplex, Reason) andalso
-            result_post(Results)
+            result_post(Results);
+        {handle_send_recv, Client, Req, _} when element(1, Return) == bad ->
+            Reason = {bad_return_value, bad},
+            exit_post(Duplex, Reason) andalso
+            result_post(Client, {'EXIT', Reason}) andalso result_post(Results);
+        {handle_send_recv, Client, Req, _} when element(1, Return) == exit ->
+            exit_post(Duplex, oops) andalso
+            result_post(Client, {'EXIT', oops}) andalso result_post(Results)
     after
         ?TIMEOUT ->
             unexpected(Client)
     end.
 
+recv(Client, {Bad, Duplex}) when Bad == bad; Bad == exit ->
+    Trap = process_flag(trap_exit, true),
+    Client ! {handle_recv, self(), Bad},
+    receive
+        {'EXIT', Duplex, Reason} ->
+            process_flag(trap_exit, Trap),
+            Reason
+    after
+        ?TIMEOUT ->
+            process_flag(trap_exit, Trap),
+            exit(timeout)
+    end;
 recv(Client, Return) ->
     Client ! {handle_recv, self(), Return},
     ok.
 
-recv_args(#state{recv=[{Client, _Req} | _]}) ->
-    Return = frequency([{1, {close, oneof([x, y, z]), oneof([a, b, c])}},
-                        {8, {result, foo}}]),
+recv_args(#state{recv=[{Client, _Req} | _], duplex=Duplex}) ->
+    Return = frequency([{1, {oneof([bad, exit]), Duplex}},
+                        {2, {close, oneof([x, y, z]), oneof([a, b, c])}},
+                        {16, {result, foo}}]),
     [Client, Return];
 recv_args(_) ->
     [undefined, undefined].
@@ -731,7 +816,18 @@ recv_next(#state{mode=full_duplex, recv=[{Client, _}],
 recv_next(#state{recv=[{Client, _} | Recvs], send=Sends} = State, _,
           [Client, {close, _, _}]) ->
     NSends = [Send || Send <- Sends, not lists:member(Send, Recvs)],
-    State#state{buffer=undefined, recv=[], result=[], send=NSends}.
+    State#state{buffer=undefined, recv=[], result=[], send=NSends};
+recv_next(#state{mode=full_duplex, recv=[{Client, _}],
+                 send=[Send | Sends], result=[],
+                 send_closed=SendClosed} = State, _, [Client, {Bad, _}])
+  when Bad == bad; Bad == exit ->
+    State#state{duplex=undefined, buffer=undefined, recv=[], result=[],
+                send=Sends, send_closed=SendClosed ++ [Send]};
+recv_next(#state{recv=[{Client, _} | Recvs], send=Sends} = State, _,
+          [Client, {Bad, _}]) when Bad == bad; Bad == exit ->
+    NSends = [Send || Send <- Sends, not lists:member(Send, Recvs)],
+    State#state{duplex=undefined, buffer=undefined, recv=[], result=[],
+                send=NSends}.
 
 recv_post(#state{recv=[{Client, Req} | Recvs], buffer=Buffer, result=Results,
                  duplex=Duplex}, [Client, Return], _) ->
@@ -750,7 +846,14 @@ recv_post(#state{recv=[{Client, Req} | Recvs], buffer=Buffer, result=Results,
         {handle_recv, Client, Req, _} when element(1, Return) == close ->
             {close, Reason, Res} = Return,
             result_post(Client, Res) andalso result_post(Results) andalso
-            close_post(Duplex, Reason) andalso closed_post(Recvs)
+            close_post(Duplex, Reason) andalso closed_post(Recvs);
+        {handle_recv, Client, Req, _} when element(1, Return) == bad ->
+            Reason = {bad_return_value, bad},
+            exit_post(Duplex, Reason) andalso
+            result_post(Client, {'EXIT', Reason}) andalso result_post(Results);
+        {handle_recv, Client, Req, _} when element(1, Return) == exit ->
+            exit_post(Duplex, oops) andalso
+            result_post(Client, {'EXIT', oops}) andalso result_post(Results)
     after
         ?TIMEOUT ->
             unexpected(Client)
@@ -802,6 +905,20 @@ close_post(Duplex, Reason) ->
             false
     end.
 
+exit_post(Duplex, Reason) ->
+    receive
+        {handle_close, Duplex, {exit, Reason, [_|_]}} ->
+            true;
+        {handle_close, Duplex, Reason2} ->
+            ct:pal("Reason~nExpected: ~p~nObserved: ~p",
+                   [{exit, Reason, []}, Reason2]),
+            false
+    after
+        ?TIMEOUT ->
+            ct:pal("close timeout"),
+            false
+    end.
+
 closed_post(Recvs) ->
     Post = fun({Client, Req}) -> result_post(Client, {closed, Req}) end,
     lists:all(Post, Recvs).
@@ -825,7 +942,7 @@ client_next(State) ->
     State.
 
 client_init(Broker, Req, Tester) ->
-    Tester ! {result, self(), duplex:send_recv(Broker, Req)}.
+    Tester ! {result, self(), catch duplex:send_recv(Broker, Req)}.
 
 flush_acks() ->
     receive

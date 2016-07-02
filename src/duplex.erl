@@ -346,38 +346,45 @@ send(Mod, Req, Socket, Conn, Ref) ->
             send_exception(Class, Reason, Stack, Conn, Ref)
     end.
 
-handle_send(Result, Mod, Socket, Conn, Ref) ->
+handle_send({Next, NReq}, Mod, Socket, Conn, Ref)
+  when Next == send_recv; Next == recv ->
     MRef = monitor(process, Conn),
     receive
-        {?MODULE, Ref, Status} ->
+        {?MODULE, Ref, {Mode, Buffer, Broker}} ->
             demonitor(MRef, [flush]),
-            handle_send(Result, Status, Mod, Socket, Conn, Ref);
-        {'DOWN', MRef, _, Pid, Reason} ->
-            handle_send(Result, {'DOWN', Pid, Reason}, Mod, Socket, Conn, Ref)
-    end.
-
-handle_send({Next, NReq}, Status, Mod, Socket, Conn, Ref)
-  when Next == send_recv; Next == recv ->
-    case Status of
-        {'DOWN', _, _} ->
-            closed(NReq, Socket, Mod);
-        {Mode, Buffer, Broker} ->
             handle(Next, Mod, NReq, Buffer, Socket, Mode, Conn, Ref, Broker);
-        closed ->
+        {?MODULE, Ref, closed} ->
+            demonitor(MRef, [flush]),
+            closed(NReq, Socket, Mod);
+        {'DOWN', MRef, _, _, _} ->
             closed(NReq, Socket, Mod)
     end;
-handle_send({result, Result}, {Mode, Buffer, Broker}, Mod, Socket, Conn, Ref)
-  when Mode == half_duplex; Mode == full_duplex ->
-    handle(result, Mod, Result, Buffer, Socket, Mode, Conn, Ref, Broker);
-handle_send({result, Result}, _, _, _, _, _) ->
-    Result;
-handle_send({close, Reason, Result}, {Mode, _, _}, _, _, Conn, Ref)
-  when Mode == half_duplex; Mode == full_duplex ->
-    close(Conn, Ref, Reason),
-    Result;
-handle_send({close, _, Result}, _, _, _, _, _) ->
-    Result;
-handle_send(Other, _, _, _, Conn, Ref) ->
+handle_send({result, Res}, Mod, Socket, Conn, Ref) ->
+    MRef = monitor(process, Conn),
+    receive
+        {?MODULE, Ref, {Mode, Buffer, Broker}} ->
+            demonitor(MRef, [flush]),
+            handle(result, Mod, Res, Buffer, Socket, Mode, Conn, Ref, Broker);
+        {?MODULE, Ref, closed} ->
+            demonitor(MRef, [flush]),
+            Res;
+        {'DOWN', MRef, _, _, _} ->
+            Res
+    end;
+handle_send({close, Reason, Result}, _, _, Conn, Ref) ->
+    MRef = monitor(process, Conn),
+    receive
+        {?MODULE, Ref, {_, _, _}} ->
+            demonitor(MRef, [flush]),
+            close(Conn, Ref, Reason),
+            Result;
+        {?MODULE, Ref, closed} ->
+            demonitor(MRef, [flush]),
+            Result;
+        {'DOWN', MRef, _, _, _} ->
+            Result
+    end;
+handle_send(Other, _, _, Conn, Ref) ->
     Reason = {bad_return_value, Other},
     try
         exit(Reason)
@@ -403,10 +410,10 @@ handle_closed(Other) ->
 
 send_exception(Class, Reason, Stack, Conn, Ref) ->
     MRef = monitor(process, Conn),
+    exception(Conn, Ref, Class, Reason, Stack),
     receive
         {?MODULE, Ref, {_, _, _}} ->
             demonitor(MRef, [flush]),
-            exception(Conn, Ref, Class, Reason, Stack),
             erlang:raise(Class, Reason, Stack);
         {?MODULE, Ref, closed} ->
             demonitor(MRef, [flush]),
