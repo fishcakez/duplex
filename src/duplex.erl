@@ -239,10 +239,16 @@ semi_duplex(info, {BRef, {go, Ref, {Pid, Timeout}, _, SojournTime}},
     Send = start_client(Ref, Pid, Timeout, SojournTime),
     {next_state, full_duplex, Data#data{send=Send, broker_ref=Ref}};
 semi_duplex(cast, {done, Ref, Buffer},
-            #data{send=#client{ref=Ref} = Client} = Data) ->
+            #data{send=#client{ref=Ref} = Client, broker_ref=BRef} = Data) ->
     cancel_client(Client),
     NData = Data#data{send=undefined, recv=undefined, buffer=Buffer},
-    {next_state, passive, NData, activate_next()};
+    receive
+        {BRef, {go, NRef, {Pid, Timeout}, _, SojournTime}} ->
+            handle_go(NRef, Pid, Timeout, SojournTime, NData)
+    after
+        1 ->
+            {next_state, passive, NData, activate_next()}
+    end;
 semi_duplex(cast, {close, Ref, Reason},
             #data{send=#client{ref=Ref} = Client} = Data) ->
     cancel_client(Client),
@@ -306,13 +312,13 @@ full_duplex(Type, Event, Data) ->
 
 closing(internal, {close, Reason},
         #data{recv=undefined, mod=Mod, socket=Socket} = Data) ->
+    NData = cancel_send(Data#data{socket=undefined}),
     _ = try
             Mod:handle_close(Reason, Socket)
         catch
             throw:_ ->
                 ok
         end,
-    NData = cancel_send(Data#data{socket=undefined}),
     report(Reason, socket_closed, Data),
     {next_state, backoff, NData, open_next()}.
 
@@ -551,7 +557,7 @@ handle_active({NState, NBuffer}, Data)
   when NState == active; NState == passive ->
     {next_state, NState, Data#data{buffer=NBuffer}};
 handle_active({close, Reason}, Data) ->
-    {next_state, closing, Data, close_next(Reason)};
+    {next_state, closing, Data#data{send=unknown}, close_next(Reason)};
 handle_active(Other, _) ->
     exit({bad_return_value, Other}).
 
@@ -606,7 +612,13 @@ handle_event(info, Info, active,
 handle_event(info, Info, State, #data{name=Name} = Data) ->
     error_logger:error_msg("Duplex connection ~p discarding message: ~p",
                            [Name, Info]),
-    {next_state, State, Data}.
+    {next_state, State, Data};
+handle_event(cast, {done, Ref, _}, _, _) when is_reference(Ref) ->
+    keep_state_and_data;
+handle_event(cast, {close, Ref, _}, _, _) when is_reference(Ref) ->
+    keep_state_and_data;
+handle_event(cast, {exception, Ref, _, _, _}, _, _) when is_reference(Ref) ->
+    keep_state_and_data.
 
 start_client(Ref, Pid, Timeout, SojournTime) ->
     MRef = monitor(process, Pid),
